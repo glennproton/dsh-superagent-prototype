@@ -55,22 +55,45 @@ def serves(args, profile):
 
 
 def ps(*options, check=False):
-    """Yield `(pid, comm, args)` tuples from `ps`; arguments are split on whitespace, so paths with spaces become several words and only `--profile` and subcommands are inspected."""
-    result = subprocess.run(['ps', '-ww', *options, '-o', 'pid=,ucomm=,args='], check=check, capture_output=True, text=True)
+    """Yield `(pid, comm, args, ppid)` tuples from `ps`; arguments are split on whitespace, so paths with spaces become several words and only `--profile` and subcommands are inspected."""
+    result = subprocess.run(['ps', '-ww', *options, '-o', 'pid=,ucomm=,ppid=,args='], check=check, capture_output=True, text=True)
     for line in result.stdout.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) == 3 and parts[0].isdigit():
-            yield int(parts[0]), parts[1], parts[2].split()
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[0].isdigit() and parts[2].isdigit():
+            # Some procps builds report thread-qualified ucomm such as `node-MainThread`;
+            # keep only the part before the first hyphen so the node/dsh name checks still match.
+            # Lines that do not parse (empty ucomm, non-numeric ppid) are skipped.
+            yield int(parts[0]), parts[1].split('-')[0], parts[3].split(), int(parts[2])
 
 
 def running(pid, profile):
     """Return whether `pid` is currently running the DSH service for `profile` (`ps -p` returns nothing once exited)."""
-    return any(found == pid and name in ('node', 'dsh') and serves(args, profile) for found, name, args in ps('-p', str(pid)))
+    return any(found == pid and name in ('node', 'dsh') and serves(args, profile) for found, name, args, _ in ps('-p', str(pid)))
 
 
 def processes(profile):
     """Return PIDs of all running DSH service processes for `profile`, including instances started outside this script and the recorded `service.pid` while still running."""
-    found = [pid for pid, name, args in ps('-ax', check=True) if name in ('node', 'dsh') and serves(args, profile)]
+    # pnpm and pnpm corepack each wrap the real dsh process in another node process with the same
+    # arguments, with a shell in between; only the outermost matching process (the one whose
+    # ancestor chain, across any intermediate processes, holds no further match) is the instance.
+    # Only a node/dsh process can be the service, as in `running()`. Without the name check any process
+    # whose arguments mention the profile -- an agent's wrapper shell running this very command, say --
+    # is miscounted as a second instance, which makes status exit 1 and stops `restart` from choosing one.
+    by_pid = {pid: (name in ('node', 'dsh') and serves(args, profile), ppid)
+              for pid, name, args, ppid in ps('-ax', check=True)}
+
+    def has_matching_ancestor(pid):
+        ppid = by_pid[pid][1]
+        while ppid is not None:
+            entry = by_pid.get(ppid)
+            if entry is None:
+                return False
+            if entry[0]:
+                return True
+            ppid = entry[1]
+        return False
+
+    found = [pid for pid, (is_service, _) in by_pid.items() if is_service and not has_matching_ancestor(pid)]
     try:
         pid = int((control(profile) / 'service.pid').read_text())
     except (OSError, ValueError):
@@ -129,18 +152,40 @@ def status(args):
     return outcome(pids, current)
 
 
+def serving_pids(profile):
+    """Return every running PID whose arguments serve `profile`: the real node service plus its pnpm/dsh wrapper layers."""
+    return {pid for pid, name, args, _ in ps('-ax', check=True)
+            if name in ('node', 'dsh') and serves(args, profile)}
+
+
+def alive(pid):
+    """Return whether `pid` still exists (`os.kill(pid, 0)` raises once it has exited)."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
 def stop(args, intentional=True):
     """Stop the service gracefully, recording a manual stop marker when `intentional` is True."""
-    pids = processes(args.profile)
-    if len(pids) > 1:
+    if len(processes(args.profile)) > 1:
         raise RuntimeError('Multiple dsh-superagent processes found; refusing to choose one.')
     # Write the stop marker before waiting so monitors respect the intentional stop even if graceful shutdown times out.
     if intentional:
         (control(args.profile) / 'manually-stopped').write_text(time.strftime('%Y-%m-%dT%H:%M:%S%z') + '\n')
-    for pid in pids:
-        os.kill(pid, signal.SIGINT)
+    # SIGINT sent only to the chain head dies at the pnpm wrapper layers and never reaches the real
+    # node service, which keeps serving the management URL after a supposedly successful stop.
+    # Signal every serving process in the chain - wrapper layers and the real service alike, deepest
+    # (highest PID) first - and wait until all of them have exited.
+    targets = sorted(serving_pids(args.profile), reverse=True)
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
     deadline = time.monotonic() + args.stop_timeout
-    while any(running(pid, args.profile) for pid in pids):
+    while any(alive(pid) for pid in targets):
         if time.monotonic() >= deadline:
             raise RuntimeError('Graceful stop timed out; no forced kill was sent. Check status.')
         time.sleep(0.5)
