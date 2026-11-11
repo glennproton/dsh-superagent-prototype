@@ -38,12 +38,12 @@ describe('account-isolated operations', () => {
     const gh = vi.spyOn(commands,'gh')
     await send(commands, reply); expect(gh).not.toHaveBeenCalled()
   })
-  it('posts the reply as the model wrote it, only to the fixed repository', async () => {
+  it('posts the reply to the fixed repository, prefixed with the disclosure line', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); vi.spyOn(commands,'pages').mockResolvedValue([])
     const gh = vi.spyOn(commands,'gh').mockResolvedValue({})
     await send(commands, reply)
-    // The disclosure line is prompt text: the model writes it, and the host adds nothing.
-    expect(gh).toHaveBeenCalledWith(['api',`repos/${REPOSITORY}/issues/8/comments`,'--method','POST','-f',expect.stringMatching(/^body=Done\n\n<!-- dsh-superagent:stable-operation -->$/)])
+    // The host prepends the line: a delivery reply that already carries it is not doubled (see tests/sources.spec.ts).
+    expect(gh).toHaveBeenCalledWith(['api',`repos/${REPOSITORY}/issues/8/comments`,'--method','POST','-f',expect.stringMatching(/^body=This is by an automated agent, not a human\.\n\nDone\n\n<!-- dsh-superagent:stable-operation -->$/)])
     await expect(new Commands(() => deployment, {}, new AbortController().signal).pages(z.unknown(),
       '../../someone/else/issues')).rejects.toThrow()
   })
