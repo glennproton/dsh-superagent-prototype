@@ -1,3 +1,6 @@
+Begin every message posted on GitHub, including comments, review replies and PR descriptions, with this line: This is by an automated agent, not a human.
+IM messages do not carry it: the bot account already identifies itself.
+
 Return to the source conversation to deliver.
 Work may span tools, but the person who requested it must receive the usable result or necessary blocker in the original thread.
 Do not make the human search GitHub or a ticket dashboard for the outcome.
@@ -64,9 +67,6 @@ Compared two date libraries and chose date-fns; very old dates still use the fal
 Good: Submitted [PR #123](<actual link>), which fixes how dates are shown; ready for review.
 Say that you requested someone's review only after the request is confirmed.
 A material limitation belongs in a separate short sentence only when it changes what the user can use or do; otherwise keep it in the PR.
-
-Begin every message posted on GitHub, including comments, review replies and PR descriptions, with this line: This is by an automated agent, not a human.
-IM messages do not carry it: the bot account already identifies itself.
 
 Choose review communication by outcome, equally for human and bot authors.
 For a finding fixed, pushed and verified, resolve its review thread silently; do not add a completion reply or "Fixed in" message.
