@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { key, liveTicket, type Follow, type OutboundMessage, type ThreadFact, type Ticket } from '../core/index.ts'
 import type { Deployment } from '../deployment.ts'
 import { sameName } from '../infra/text.ts'
+import { DISCLOSURE, withDisclosure } from './disclosure.ts'
 import type { SourceContext } from './host.ts'
 import { githubPage, SOURCE, UserSchema } from './github-trigger.ts'
 
@@ -62,10 +63,21 @@ export async function observePull(ctx: SourceContext, pr: Pull): Promise<boolean
     const ticket = candidates.length === 1 ? candidates[0]! : undefined
     // A PR the ticket followed until it closed, and that is open again, is followed again.
     const reopened = ticket?.follows?.some(item => item.thread === `${SOURCE}:${pr.number}` && item.closed)
-    if (ticket && (reopened || pullsOf(ticket, true).every(number => number === pr.number))) claimPull(ctx, ticket.id, pr)
+    if (ticket && (reopened || pullsOf(ticket, true).every(number => number === pr.number))) {
+      const refused = claimPull(ctx, ticket.id, pr)
+      if (!refused) await ensurePullDisclosure(ctx, pr)
+    }
   }
   ctx.threads.describe(`github:${pr.number}`, { facts: { autoMerge: !ended && pr.auto_merge != null ? AUTO_MERGE_ON : null } })
   return ended
+}
+/**
+ * Ensures a PR the agent authored begins with the disclosure line, patching the body once. The worker opens its own PR
+ * with `gh`, so this host-side pass is the choke point that also covers a PR body the worker wrote without the line.
+ */
+export async function ensurePullDisclosure(ctx: Pick<SourceContext, 'commands' | 'deployment'>, pr: Pull): Promise<void> {
+  if (!agentPull(pr, ctx.deployment) || (pr.body ?? '').trimStart().startsWith(DISCLOSURE)) return
+  await ctx.commands.api(z.unknown(), `pulls/${pr.number}`, '--method', 'PATCH', '-f', `body=${withDisclosure(pr.body ?? '')}`)
 }
 function bind(ctx: SourceContext, ticketId: string, pr: Pull, own: boolean): void {
   ctx.atomic(() => {

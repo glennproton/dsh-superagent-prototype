@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { Engine, MemoryRepositories, key, type Assessor, type Executor, type Thread, type Ticket, type Trigger } from '../src/core/index.ts'
+import { Engine, MemoryRepositories, key, type Assessor, type Executor, type OutboundMessage, type Thread, type Ticket, type Trigger } from '../src/core/index.ts'
 import { backfillChat, consumerRetry, feishuKind, feishuTriggerId, feishuRef, feishuTime, feishuTrigger, historyEvent }
   from '../src/sources/feishu.ts'
 import { KV } from '../src/kv.ts'
 import { apply as applyFeishu, pollThreads as pollFeishuThreads } from '../src/sources/feishu.ts'
 import { runFeishu } from '../src/sources/feishu-loops.ts'
 import { commentTrigger, githubAddress, githubChannel, issueTrigger, type GithubComment, type GithubIssue } from '../src/sources/github-trigger.ts'
-import { claimPull, observePull, pullEndNotices, pullOf, ticketBranch, type Pull } from '../src/sources/github-pull.ts'
+import { claimPull, ensurePullDisclosure, observePull, pullEndNotices, pullOf, ticketBranch, type Pull } from '../src/sources/github-pull.ts'
+import { sendGithub } from '../src/sources/github-channel.ts'
+import { DISCLOSURE } from '../src/sources/disclosure.ts'
 import { ciCounts, ciFact, ciSummary } from '../src/sources/github-read.ts'
 import { apply as applyGithub, githubKind, pollFailure, pollRound } from '../src/sources/github.ts'
 import { pollThreads as pollGithubThreads } from '../src/sources/github.ts'
@@ -402,6 +404,8 @@ describe('github source', () => {
   })
   it('binds a PR to the unique live ticket on its branch and ends tickets when the PR closes', async () => {
     const h = host()
+    // The claim pass patches an agent PR body that lacks the disclosure line.
+    vi.spyOn(h.commands, 'run').mockResolvedValue('{}')
     const decisionId = 'd'
     const request = feishuTrigger({ message_id: 'om_1', chat_id: 'oc_1', chat_type: 'group', sender_id: MEMBER, sender_type: 'user', content: '@bot 修一下标题', create_time: '1', mentions: [{ id: 'ou_bot' }] }, 'ou_bot', 'cli_bot')!
     h.store.triggers.save(request)
@@ -452,6 +456,8 @@ describe('github source', () => {
   })
   it('follows a PR it opened again when it reopens, while another PR it opened is open', async () => {
     const h = host()
+    // The claim pass patches an agent PR body that lacks the disclosure line.
+    vi.spyOn(h.commands, 'run').mockResolvedValue('{}')
     h.store.tickets.save({ ...openTicket('t5'), execution: execution('fix-5'),
       follows: [{ thread: 'github:21', own: true }, { thread: 'github:22', own: true, closed: { at: '2026-09-02T00:00:00.000Z', outcome: 'closed' } }] })
     await observePull(h, agentsPull(22, 'agent/fix-5'))
@@ -966,6 +972,39 @@ describe('github source', () => {
     expect(await observePull(h, endedPull(43, '2026-09-02T00:00:00Z'))).toBe(true)
     expect(h.store.tickets.get('t1')).toMatchObject({ ended: { outcome: 'merged' } })
     expect(claimPull(h, 't1', openPull(30))).toBe('Ticket ended because its PR was closed')
+    h.store.close()
+  })
+  it('posts every host GitHub comment with the disclosure line once, even when the text already carries it', async () => {
+    const h = host()
+    const calls: string[][] = []
+    vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => { calls.push(args); return '[]' })
+    const message = (id: string, text: string): OutboundMessage => ({ id, kind: 'acknowledgement',
+      channel: { source: 'github', thread: 'github:7', address: { number: '7', url: 'https://github.com/acme/widgets/issues/7' } }, text })
+    expect(await sendGithub(h, message('m1', 'On it: fixing the title.'))).toBe('sent')
+    expect(await sendGithub(h, message('m2', `${DISCLOSURE}\n\nOn it: fixing the title.`))).toBe('sent')
+    const bodies = calls.filter(args => args.includes('POST')).map(args => args.at(-1)!)
+    expect(bodies).toHaveLength(2)
+    for (const body of bodies) {
+      expect(body.split('\n')[0]).toBe(`body=${DISCLOSURE}`)
+      expect(body.match(/This is by an automated agent/g)).toHaveLength(1)
+    }
+    h.store.close()
+  })
+  it('patches an agent PR body that lacks the disclosure line, and leaves a disclosed or human PR alone', async () => {
+    const h = host()
+    h.store.tickets.save({ ...openTicket('t1'), execution: execution('fix-1') })
+    const calls: string[][] = []
+    vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => { calls.push(args); return '{}' })
+    const agent = (number: number, body?: string): Pull => ({ ...openPull(number), user: { login: 'agent-bot' }, body,
+      head: { sha: 'abc', ref: 'agent/fix-1', repo: { full_name: 'acme/widgets' } } })
+    expect(await observePull(h, agent(43, 'Fixes the title.'))).toBe(false)
+    const patches = calls.filter(args => args.includes('PATCH'))
+    expect(patches).toHaveLength(1)
+    expect(patches[0]!.at(-1)).toBe(`body=${DISCLOSURE}\n\nFixes the title.`)
+    calls.length = 0
+    await ensurePullDisclosure(h, agent(44, `${DISCLOSURE}\n\nFixes the margin.`))
+    await ensurePullDisclosure(h, { ...openPull(45), body: 'Human PR.' })
+    expect(calls.filter(args => args.includes('PATCH'))).toHaveLength(0)
     h.store.close()
   })
 })
